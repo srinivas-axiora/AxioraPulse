@@ -9,6 +9,7 @@ services:
       - ./backend/.env
     environment:
       - DATABASE_URL=postgresql://postgres:root@db:5432/nexpulse
+      - PORT=8000
     depends_on:
       - db
     volumes:
@@ -21,7 +22,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: root
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 

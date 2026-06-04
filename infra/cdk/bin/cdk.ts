@@ -2,52 +2,23 @@
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { AxioraPulseStack } from '../lib/axiora-pulse-stack';
-import { GitHubOidcStack } from '../lib/github-oidc-stack';
+import { AxioraPulsePipelineStack } from '../lib/axiora-pulse-pipeline-stack';
 
 const app = new cdk.App();
 
-// Global / Shared Infrastructure
-new GitHubOidcStack(app, 'AxioraPulseGitHubOidcStack', {
-  env: { 
-    account: '217757579310', 
-    region: 'ap-south-1' 
-  },
-  repositoryConfig: [
-    { owner: 'Kiran-axiora', repo: 'AxioraPulse' }
-  ],
-  description: 'GitHub Actions OIDC role for AxioraPulse',
+const env = { 
+  account: '039971552199', 
+  region: 'us-east-1' 
+};
+
+const appStack = new AxioraPulseStack(app, 'AxioraPulseStack', {
+  env,
+  description: 'Production SaaS environment for AxioraPulse in us-east-1',
 });
 
-// Dev Environment
-new AxioraPulseStack(app, 'AxioraPulseStackDev', {
-  environment: 'dev',
-  env: { 
-    account: '079975324160', 
-    region: 'ap-south-1' 
-  },
-  description: 'Development environment for AxioraPulse',
+new AxioraPulsePipelineStack(app, 'AxioraPulsePipelineStack', {
+  env,
+  ecrRepo: appStack.ecrRepo,
+  ecsService: appStack.ecsService,
+  description: 'CI/CD pipeline for AxioraPulse in us-east-1',
 });
-
-// QA Environment
-new AxioraPulseStack(app, 'AxioraPulseStackQa', {
-  environment: 'qa',
-  env: { 
-    account: process.env.CDK_QA_ACCOUNT || process.env.CDK_DEFAULT_ACCOUNT, 
-    region: process.env.CDK_QA_REGION || 'ap-south-1' 
-  },
-  description: 'QA environment for AxioraPulse',
-});
-
-// Production (STRICTLY DISABLED)
-// To enable, uncomment and set prodOverride: true
-/*
-new AxioraPulseStack(app, 'AxioraPulseStackProd', {
-  environment: 'prod',
-  prodOverride: false, // Must be true to deploy
-  env: { 
-    account: '217757579310', 
-    region: 'ap-south-1' 
-  },
-  description: 'Production environment for AxioraPulse',
-});
-*/

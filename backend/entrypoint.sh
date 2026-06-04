@@ -16,8 +16,16 @@ import time
 import psycopg2
 import os
 import sys
+import json
 
 db_url = os.environ.get('DATABASE_URL')
+if not db_url and os.environ.get('DB_SECRET_JSON'):
+    try:
+        secret = json.loads(os.environ.get('DB_SECRET_JSON'))
+        db_url = f\"postgresql://{secret['username']}:{secret['password']}@{secret['host']}:{secret['port']}/{secret.get('dbname', 'postgres')}\"
+    except Exception as e:
+        print('Error parsing DB_SECRET_JSON in entrypoint:', e)
+
 if db_url and '://' in db_url:
     protocol, rest = db_url.split('://', 1)
     if '+' in protocol:
@@ -53,4 +61,4 @@ alembic upgrade head
 echo "Database setup complete!"
 
 # Start the application
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8080}"

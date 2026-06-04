@@ -1,5 +1,6 @@
 
 import os
+import json
 import boto3
 from dotenv import load_dotenv
 from functools import lru_cache
@@ -17,6 +18,14 @@ def get_ssm_parameter(name: str):
         return None
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL and os.getenv("DB_SECRET_JSON"):
+    try:
+        secret = json.loads(os.getenv("DB_SECRET_JSON"))
+        DATABASE_URL = f"postgresql://{secret['username']}:{secret['password']}@{secret['host']}:{secret['port']}/{secret.get('dbname', 'postgres')}"
+    except Exception as e:
+        import sys
+        print(f"Error parsing DB_SECRET_JSON: {e}", file=sys.stderr)
+
 SECRET_KEY = os.getenv("SECRET_KEY")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")  # e.g. https://axiorapulse.com

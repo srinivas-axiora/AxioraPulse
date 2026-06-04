@@ -4,62 +4,45 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
-import * as ssm from 'aws-cdk-lib/aws-ssm';
+import * as elbv2_actions from 'aws-cdk-lib/aws-elasticloadbalancingv2-actions';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as logs from 'aws-cdk-lib/aws-logs';
-
-export interface AxioraPulseStackProps extends cdk.StackProps {
-  environment: 'dev' | 'qa' | 'prod';
-  prodOverride?: boolean;
-}
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as targets from 'aws-cdk-lib/aws-route53-targets';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cw_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as codedeploy from 'aws-cdk-lib/aws-codedeploy';
 
 export class AxioraPulseStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props: AxioraPulseStackProps) {
+  public readonly ecsService: ecs.FargateService;
+  public readonly ecrRepo: ecr.Repository;
+  public readonly userPool: cognito.UserPool;
+  public readonly databaseCluster: rds.DatabaseCluster;
+  public readonly alb: elbv2.ApplicationLoadBalancer;
+  public readonly cognitoClient: cognito.UserPoolClient;
+
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const envName = props.environment;
-
-    // Safety Check: Prevent production deployment unless explicitly overridden
-    if (envName === 'prod' && !props.prodOverride) {
-      throw new Error('Production deployment is disabled. Set prodOverride: true to enable.');
-    }
-
-    // Safety Check: Verify target account
-    const expectedAccounts: { [key: string]: string } = {
-      'dev': '079975324160',
-      'prod': '217757579310',
-    };
-
-    if (expectedAccounts[envName] && this.account !== expectedAccounts[envName]) {
-      throw new Error(`Account mismatch! Environment ${envName} expected account ${expectedAccounts[envName]} but got ${this.account}.`);
-    }
-
-    // Enable termination protection for PROD
-    if (envName === 'prod') {
-      // Note: terminationProtection can only be set on the Stack before it is instantiated or via CfnStack
-      // But we can suggest it or try to set it via stack props in bin/cdk.ts
-    }
-
-    // Log target information
-    console.log(`\n🚀 Deploying AxioraPulse`);
-    console.log(`📍 Environment: ${envName}`);
-    console.log(`🆔 Account:     ${this.account}`);
-    console.log(`🌍 Region:      ${this.region}`);
-    console.log(`📦 Stack:       ${this.stackName}\n`);
-
-    // 1. VPC
+    // 1. VPC Configuration (2 AZs, public ALB subnets & private ECS/RDS subnets)
     const vpc = new ec2.Vpc(this, 'Vpc', {
+      ipAddresses: ec2.IpAddresses.cidr('10.0.0.0/16'),
       maxAzs: 2,
-      natGateways: 1, // To save costs in Dev/QA, we use 1 NAT gateway
+      natGateways: 2,
       subnetConfiguration: [
         {
           name: 'Public',
           subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask: 24,
         },
         {
           name: 'Private',
           subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask: 24,
         },
       ],
     });
@@ -68,228 +51,372 @@ export class AxioraPulseStack extends cdk.Stack {
     const albSg = new ec2.SecurityGroup(this, 'AlbSg', {
       vpc,
       allowAllOutbound: true,
-      description: `ALB Security Group for AxioraPulse ${envName}`,
+      description: 'Security Group for AxioraPulse ALB',
     });
-    albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80));
-    albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443));
+    albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP traffic');
+    albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'Allow HTTPS traffic');
 
-    const backendSg = new ec2.SecurityGroup(this, 'BackendSg', {
+    const ecsSg = new ec2.SecurityGroup(this, 'EcsSg', {
       vpc,
       allowAllOutbound: true,
-      description: `Backend Security Group for AxioraPulse ${envName}`,
+      description: 'Security Group for AxioraPulse ECS tasks',
     });
-    backendSg.addIngressRule(albSg, ec2.Port.tcp(8000));
-
-    const frontendSg = new ec2.SecurityGroup(this, 'FrontendSg', {
-      vpc,
-      allowAllOutbound: true,
-      description: `Frontend Security Group for AxioraPulse ${envName}`,
-    });
-    frontendSg.addIngressRule(albSg, ec2.Port.tcp(80));
+    ecsSg.addIngressRule(albSg, ec2.Port.tcp(8080), 'Allow traffic from ALB on port 8080');
 
     const dbSg = new ec2.SecurityGroup(this, 'DbSg', {
       vpc,
       allowAllOutbound: true,
-      description: `Database Security Group for AxioraPulse ${envName}`,
+      description: 'Security Group for Aurora DB Cluster',
     });
-    dbSg.addIngressRule(backendSg, ec2.Port.tcp(5432));
+    dbSg.addIngressRule(ecsSg, ec2.Port.tcp(5432), 'Allow PostgreSQL traffic from ECS tasks');
 
-    // 3. RDS
-    const database = new rds.DatabaseInstance(this, 'Database', {
-      engine: rds.DatabaseInstanceEngine.postgres({ version: rds.PostgresEngineVersion.VER_16 }),
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+    // 3. ECR Repository
+    this.ecrRepo = new ecr.Repository(this, 'EcrRepo', {
+      repositoryName: 'axiorapulse-repo',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      emptyOnDelete: true,
+    });
+
+    // 4. Aurora PostgreSQL Serverless v2 DB
+    this.databaseCluster = new rds.DatabaseCluster(this, 'DatabaseCluster', {
+      engine: rds.DatabaseClusterEngine.auroraPostgres({
+        version: rds.AuroraPostgresEngineVersion.VER_16_1,
+      }),
       vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [dbSg],
-      databaseName: 'axiorapulse',
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // For Dev/QA
-      deletionProtection: false,
+      writer: rds.ClusterInstance.serverlessV2('Writer'),
+      readers: [
+        rds.ClusterInstance.serverlessV2('Reader', { scaleWithWriter: true }),
+      ],
+      serverlessV2MinCapacity: 0.5,
+      serverlessV2MaxCapacity: 2.0,
+      defaultDatabaseName: 'axiorapulse',
+      credentials: rds.Credentials.fromGeneratedSecret('postgres', {
+        secretName: 'axiorapulse-db-credentials',
+      }),
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // 4. Cognito
-    const userPool = new cognito.UserPool(this, 'UserPool', {
-      userPoolName: `AxioraPulseUserPool-${envName}`,
+    // 5. Cognito Setup
+    this.userPool = new cognito.UserPool(this, 'UserPool', {
+      userPoolName: 'AxioraPulseUserPool',
       selfSignUpEnabled: true,
       signInAliases: { email: true },
       autoVerify: { email: true },
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    const userPoolClient = userPool.addClient('UserPoolClient', {
-      userPoolClientName: `AxioraPulseClient-${envName}`,
-      authFlows: {
-        adminUserPassword: true,
-        custom: true,
-        userPassword: true,
-        userSrp: true,
+    this.cognitoClient = this.userPool.addClient('UserPoolClient', {
+      userPoolClientName: 'AxioraPulseClient',
+      generateSecret: true,
+      oAuth: {
+        flows: {
+          authorizationCodeGrant: true,
+        },
+        scopes: [cognito.OAuthScope.EMAIL, cognito.OAuthScope.OPENID],
+        callbackUrls: [
+          'https://axiorapulse.com/oauth2/idpresponse',
+          'https://www.axiorapulse.com/oauth2/idpresponse',
+        ],
       },
     });
 
-    // 5. ECS Cluster
-    const cluster = new ecs.Cluster(this, 'Cluster', {
+    const userPoolDomain = this.userPool.addDomain('UserPoolDomain', {
+      cognitoDomain: {
+        domainPrefix: 'axiorapulse-auth-prod-env',
+      },
+    });
+
+    // 6. Route 53 + ACM Certificate Setup
+    let hostedZone: route53.IHostedZone;
+    const hostedZoneIdContext = this.node.tryGetContext('hostedZoneId');
+    if (hostedZoneIdContext) {
+      hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
+        hostedZoneId: hostedZoneIdContext,
+        zoneName: 'axiorapulse.com',
+      });
+    } else if (this.node.tryGetContext('localSynth') === 'true' || process.env.CDK_LOCAL_SYNTH === 'true') {
+      hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
+        hostedZoneId: 'Z00000000000000000000',
+        zoneName: 'axiorapulse.com',
+      });
+    } else {
+      hostedZone = route53.HostedZone.fromLookup(this, 'HostedZone', {
+        domainName: 'axiorapulse.com',
+      });
+    }
+
+    const certificate = new acm.Certificate(this, 'Certificate', {
+      domainName: 'axiorapulse.com',
+      subjectAlternativeNames: ['*.axiorapulse.com'],
+      validation: acm.CertificateValidation.fromDns(hostedZone),
+    });
+
+    // 7. Load Balancer (ALB) Setup
+    this.alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
       vpc,
-      clusterName: `axiora-pulse-cluster-${envName}`,
+      internetFacing: true,
+      securityGroup: albSg,
+      loadBalancerName: 'axiorapulse-alb',
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+    });
+
+    // HTTP Port 80 Redirects to HTTPS
+    this.alb.addRedirect({
+      sourceProtocol: elbv2.ApplicationProtocol.HTTP,
+      sourcePort: 80,
+      targetProtocol: elbv2.ApplicationProtocol.HTTPS,
+      targetPort: 443,
+    });
+
+    // HTTPS Port 443 Listener
+    const httpsListener = this.alb.addListener('HttpsListener', {
+      port: 443,
+      certificates: [certificate],
+      open: true,
+    });
+
+    // Target Groups for Blue/Green Deployments
+    const blueTargetGroup = new elbv2.ApplicationTargetGroup(this, 'EcsBlueTargetGroup', {
+      vpc,
+      port: 8080,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP,
+      healthCheck: {
+        path: '/health',
+        protocol: elbv2.Protocol.HTTP,
+        healthyHttpCodes: '200',
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(10),
+      },
+    });
+
+    const greenTargetGroup = new elbv2.ApplicationTargetGroup(this, 'EcsGreenTargetGroup', {
+      vpc,
+      port: 8080,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP,
+      healthCheck: {
+        path: '/health',
+        protocol: elbv2.Protocol.HTTP,
+        healthyHttpCodes: '200',
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(10),
+      },
+    });
+
+    // Route 53 A Records pointing to ALB
+    new route53.ARecord(this, 'AlbAliasRecord', {
+      zone: hostedZone,
+      target: route53.RecordTarget.fromAlias(new targets.LoadBalancerTarget(this.alb)),
+    });
+
+    new route53.ARecord(this, 'AlbWwwAliasRecord', {
+      zone: hostedZone,
+      recordName: 'www',
+      target: route53.RecordTarget.fromAlias(new targets.LoadBalancerTarget(this.alb)),
+    });
+
+    // 8. Cognito Integration with ALB Rules
+    // Rule 1: Public paths bypass Cognito (Group 1)
+    httpsListener.addAction('PublicRoutes1', {
+      priority: 1,
+      conditions: [
+        elbv2.ListenerCondition.pathPatterns([
+          '/s/*',
+          '/embed/*',
+          '/public/*',
+          '/health',
+          '/docs',
+        ]),
+      ],
+      action: elbv2.ListenerAction.forward([blueTargetGroup]),
+    });
+
+    // Rule 2: Public paths bypass Cognito (Group 2)
+    httpsListener.addAction('PublicRoutes2', {
+      priority: 2,
+      conditions: [
+        elbv2.ListenerCondition.pathPatterns([
+          '/redoc',
+          '/openapi.json',
+        ]),
+      ],
+      action: elbv2.ListenerAction.forward([blueTargetGroup]),
+    });
+
+    // Rule 2: Default action authenticates via Cognito
+    const cognitoAuthAction = new elbv2_actions.AuthenticateCognitoAction({
+      userPool: this.userPool,
+      userPoolClient: this.cognitoClient,
+      userPoolDomain,
+      next: elbv2.ListenerAction.forward([blueTargetGroup]),
+    });
+
+    httpsListener.addAction('DefaultAuth', {
+      action: cognitoAuthAction,
+    });
+
+    // 9. ECS Fargate Setup
+    const cluster = new ecs.Cluster(this, 'EcsCluster', {
+      vpc,
+      clusterName: 'axiorapulse-cluster',
       containerInsights: true,
     });
 
-    // 6. ALBs
-    const backendAlb = new elbv2.ApplicationLoadBalancer(this, 'BackendAlb', {
-      vpc,
-      internetFacing: true,
-      securityGroup: albSg,
-      loadBalancerName: `axiora-pulse-backend-alb-${envName}`,
-    });
-
-    const frontendAlb = new elbv2.ApplicationLoadBalancer(this, 'FrontendAlb', {
-      vpc,
-      internetFacing: true,
-      securityGroup: albSg,
-      loadBalancerName: `axiora-pulse-frontend-alb-${envName}`,
-    });
-
-    // 7. ECS Tasks and Services
-    
-    // IAM Roles
     const executionRole = new iam.Role(this, 'EcsTaskExecutionRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'),
-        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMReadOnlyAccess'),
       ],
     });
+    this.databaseCluster.secret!.grantRead(executionRole);
 
     const taskRole = new iam.Role(this, 'EcsTaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
 
-    // Backend
-    const backendTaskDef = new ecs.FargateTaskDefinition(this, 'BackendTaskDef', {
-      memoryLimitMiB: 1024,
-      cpu: 512,
+    const taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDef', {
+      memoryLimitMiB: 2048,
+      cpu: 1024,
       executionRole,
       taskRole,
-      family: `pulse-backend-${envName}`,
+      family: 'axiorapulse-app',
     });
 
-    const backendContainer = backendTaskDef.addContainer('BackendContainer', {
-      image: ecs.ContainerImage.fromRegistry('217757579310.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-fastapi:latest'), // Placeholder
-      logging: ecs.LogDrivers.awsLogs({ 
-        streamPrefix: 'ecs', 
-        logGroup: new logs.LogGroup(this, 'BackendLogGroup', {
-          logGroupName: `/ecs/pulse-backend-${envName}`,
+    taskDefinition.addContainer('AppContainer', {
+      image: ecs.ContainerImage.fromEcrRepository(this.ecrRepo, 'latest'),
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'ecs',
+        logGroup: new logs.LogGroup(this, 'AppLogGroup', {
+          logGroupName: '/ecs/axiorapulse-app',
           retention: logs.RetentionDays.ONE_MONTH,
           removalPolicy: cdk.RemovalPolicy.DESTROY,
-        })
+        }),
       }),
-      environment: {
-        'ENVIRONMENT': envName,
-        'COGNITO_REGION': this.region,
-        'COGNITO_USER_POOL_ID': userPool.userPoolId,
-        'COGNITO_APP_CLIENT_ID': userPoolClient.userPoolClientId,
-      },
+      portMappings: [
+        {
+          containerPort: 8080,
+          protocol: ecs.Protocol.TCP,
+        },
+      ],
       secrets: {
-        'DATABASE_URL': ecs.Secret.fromSsmParameter(ssm.StringParameter.fromSecureStringParameterAttributes(this, 'DbUrlParam', { parameterName: `/axiorapulse/${envName}/DATABASE_URL`, version: 1 })),
-        'SECRET_KEY': ecs.Secret.fromSsmParameter(ssm.StringParameter.fromSecureStringParameterAttributes(this, 'SecretKeyParam', { parameterName: `/axiorapulse/${envName}/SECRET_KEY`, version: 1 })),
-        'ANTHROPIC_KEY': ecs.Secret.fromSsmParameter(ssm.StringParameter.fromSecureStringParameterAttributes(this, 'AnthropicKeyParam', { parameterName: `/axiorapulse/${envName}/ANTHROPIC_KEY`, version: 1 })),
-        'EMAIL_FROM': ecs.Secret.fromSsmParameter(ssm.StringParameter.fromSecureStringParameterAttributes(this, 'EmailFromParam', { parameterName: `/axiorapulse/${envName}/EMAIL_FROM`, version: 1 })),
-        'FRONTEND_URL': ecs.Secret.fromSsmParameter(ssm.StringParameter.fromSecureStringParameterAttributes(this, 'FrontendUrlParam', { parameterName: `/axiorapulse/${envName}/FRONTEND_URL`, version: 1 })),
-        'RAZORPAY_KEY_ID': ecs.Secret.fromSsmParameter(ssm.StringParameter.fromSecureStringParameterAttributes(this, 'RazorpayKeyIdParam', { parameterName: `/axiorapulse/${envName}/RAZORPAY_KEY_ID`, version: 1 })),
-        'RAZORPAY_KEY_SECRET': ecs.Secret.fromSsmParameter(ssm.StringParameter.fromSecureStringParameterAttributes(this, 'RazorpayKeySecretParam', { parameterName: `/axiorapulse/${envName}/RAZORPAY_KEY_SECRET`, version: 1 })),
+        'DB_SECRET_JSON': ecs.Secret.fromSecretsManager(this.databaseCluster.secret!),
       },
-      healthCheck: {
-        command: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"],
-        interval: cdk.Duration.seconds(30),
-        timeout: cdk.Duration.seconds(10),
-        retries: 3,
-        startPeriod: cdk.Duration.seconds(60),
-      }
+      environment: {
+        'PORT': '8080',
+        'ENVIRONMENT': 'production',
+        'COGNITO_USER_POOL_ID': this.userPool.userPoolId,
+        'COGNITO_APP_CLIENT_ID': this.cognitoClient.userPoolClientId,
+        'COGNITO_REGION': this.region,
+      },
     });
 
-    backendContainer.addPortMappings({
-      containerPort: 8000,
-      protocol: ecs.Protocol.TCP,
-    });
-
-    const backendService = new ecs.FargateService(this, 'BackendService', {
+    this.ecsService = new ecs.FargateService(this, 'FargateService', {
       cluster,
-      taskDefinition: backendTaskDef,
-      desiredCount: 1,
-      securityGroups: [backendSg],
+      taskDefinition,
+      desiredCount: 2,
+      securityGroups: [ecsSg],
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       assignPublicIp: false,
-      serviceName: `pulse-backend-service-${envName}`,
-    });
-
-    const backendListener = backendAlb.addListener('BackendListener', {
-      port: 80, // Using 80 for simplicity in Dev/QA, can add HTTPS later
-      open: true,
-    });
-    backendListener.addTargets('BackendTarget', {
-      port: 8000,
-      targets: [backendService],
-      healthCheck: {
-        path: '/health',
-        interval: cdk.Duration.seconds(30),
+      serviceName: 'axiorapulse-service',
+      minHealthyPercent: 50,
+      maxHealthyPercent: 200,
+      deploymentController: {
+        type: ecs.DeploymentControllerType.CODE_DEPLOY,
       },
     });
 
-    // Frontend
-    const frontendTaskDef = new ecs.FargateTaskDefinition(this, 'FrontendTaskDef', {
-      memoryLimitMiB: 512,
-      cpu: 256,
-      executionRole,
-      family: `pulse-frontend-${envName}`,
+    // Attach Blue target group initially
+    blueTargetGroup.addTarget(this.ecsService);
+
+    // 10. Auto-Scaling
+    const scaling = this.ecsService.autoScaleTaskCount({
+      minCapacity: 2,
+      maxCapacity: 10,
+    });
+    scaling.scaleOnCpuUtilization('CpuScaling', {
+      targetUtilizationPercent: 70,
+    });
+    scaling.scaleOnMemoryUtilization('MemoryScaling', {
+      targetUtilizationPercent: 70,
     });
 
-    const frontendContainer = frontendTaskDef.addContainer('FrontendContainer', {
-      image: ecs.ContainerImage.fromRegistry('217757579310.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-frontend:latest'), // Placeholder
-      logging: ecs.LogDrivers.awsLogs({ 
-        streamPrefix: 'ecs', 
-        logGroup: new logs.LogGroup(this, 'FrontendLogGroup', {
-          logGroupName: `/ecs/pulse-frontend-${envName}`,
-          retention: logs.RetentionDays.ONE_MONTH,
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
-        })
-      }),
-      healthCheck: {
-        command: ["CMD-SHELL", "wget -qO- http://localhost:80/ || exit 1"],
-        interval: cdk.Duration.seconds(30),
-        timeout: cdk.Duration.seconds(5),
-        retries: 3,
-        startPeriod: cdk.Duration.seconds(10),
-      }
-    });
-
-    frontendContainer.addPortMappings({
-      containerPort: 80,
-      protocol: ecs.Protocol.TCP,
-    });
-
-    const frontendService = new ecs.FargateService(this, 'FrontendService', {
-      cluster,
-      taskDefinition: frontendTaskDef,
-      desiredCount: 1,
-      securityGroups: [frontendSg],
-      assignPublicIp: false,
-      serviceName: `pulse-frontend-service-${envName}`,
-    });
-
-    const frontendListener = frontendAlb.addListener('FrontendListener', {
-      port: 80,
-      open: true,
-    });
-    frontendListener.addTargets('FrontendTarget', {
-      port: 80,
-      targets: [frontendService],
-      healthCheck: {
-        path: '/',
-        interval: cdk.Duration.seconds(30),
+    // 11. CodeDeploy ECS Blue/Green Configuration
+    const deploymentGroup = new codedeploy.EcsDeploymentGroup(this, 'EcsDeploymentGroup', {
+      service: this.ecsService,
+      blueGreenDeploymentConfig: {
+        blueTargetGroup: blueTargetGroup,
+        greenTargetGroup: greenTargetGroup,
+        listener: httpsListener,
       },
+      deploymentConfig: codedeploy.EcsDeploymentConfig.ALL_AT_ONCE,
     });
+
+    // 12. Monitoring & SNS Alarms
+    const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
+      topicName: 'axiorapulse-alarms',
+    });
+
+    const cpuAlarm = new cloudwatch.Alarm(this, 'CpuAlarm', {
+      metric: this.ecsService.metricCpuUtilization(),
+      threshold: 80,
+      evaluationPeriods: 3,
+      datapointsToAlarm: 3,
+      alarmDescription: 'High CPU utilization alarm for AxioraPulse Fargate Service',
+    });
+    cpuAlarm.addAlarmAction(new cw_actions.SnsAction(alarmTopic));
+
+    const memoryAlarm = new cloudwatch.Alarm(this, 'MemoryAlarm', {
+      metric: this.ecsService.metricMemoryUtilization(),
+      threshold: 80,
+      evaluationPeriods: 3,
+      datapointsToAlarm: 3,
+      alarmDescription: 'High Memory utilization alarm for AxioraPulse Fargate Service',
+    });
+    memoryAlarm.addAlarmAction(new cw_actions.SnsAction(alarmTopic));
+
+    const error5xxAlarm = new cloudwatch.Alarm(this, 'Error5xxAlarm', {
+      metric: this.alb.metricHttpCodeTarget(elbv2.HttpCodeTarget.TARGET_5XX_COUNT),
+      threshold: 1,
+      evaluationPeriods: 1,
+      alarmDescription: 'ALB Target returned 5XX error',
+    });
+    error5xxAlarm.addAlarmAction(new cw_actions.SnsAction(alarmTopic));
+
+    const latencyAlarm = new cloudwatch.Alarm(this, 'LatencyAlarm', {
+      metric: this.alb.metricTargetResponseTime(),
+      threshold: 2, // 2 seconds
+      evaluationPeriods: 1,
+      alarmDescription: 'High Target Response Latency',
+    });
+    latencyAlarm.addAlarmAction(new cw_actions.SnsAction(alarmTopic));
 
     // Outputs
-    new cdk.CfnOutput(this, 'UserPoolId', { value: userPool.userPoolId });
-    new cdk.CfnOutput(this, 'UserPoolClientId', { value: userPoolClient.userPoolClientId });
-    new cdk.CfnOutput(this, 'DbEndpoint', { value: database.dbInstanceEndpointAddress });
-    new cdk.CfnOutput(this, 'BackendAlbDns', { value: backendAlb.loadBalancerDnsName });
-    new cdk.CfnOutput(this, 'FrontendAlbDns', { value: frontendAlb.loadBalancerDnsName });
+    new cdk.CfnOutput(this, 'AlbDnsName', {
+      value: this.alb.loadBalancerDnsName,
+      description: 'The DNS name of the Application Load Balancer',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: this.userPool.userPoolId,
+      description: 'The Cognito User Pool ID',
+    });
+
+    new cdk.CfnOutput(this, 'EcrRepoUri', {
+      value: this.ecrRepo.repositoryUri,
+      description: 'The ECR Repository URI',
+    });
+
+    new cdk.CfnOutput(this, 'DatabaseWriterEndpoint', {
+      value: this.databaseCluster.clusterEndpoint.hostname,
+      description: 'The Endpoint of the Aurora Database Writer Instance',
+    });
+
+    new cdk.CfnOutput(this, 'DatabaseReaderEndpoint', {
+      value: this.databaseCluster.clusterReadEndpoint.hostname,
+      description: 'The Endpoint of the Aurora Database Reader Instance',
+    });
   }
 }
