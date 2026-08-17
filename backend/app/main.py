@@ -10,6 +10,7 @@ Startup sequence:
   4. Health-check endpoint
 """
 
+# Target AWS Deployment Account: 847013096108
 import sys
 import os
 import logging
