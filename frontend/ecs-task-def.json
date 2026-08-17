@@ -4,11 +4,11 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
   "memory": "512",
-  "executionRoleArn": "arn:aws:iam::217757579310:role/ecsTaskExecutionRole",
+  "executionRoleArn": "arn:aws:iam::847013096108:role/ecsTaskExecutionRole",
   "containerDefinitions": [
     {
       "name": "pulse-frontend",
-      "image": "217757579310.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-frontend:latest",
+      "image": "847013096108.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-frontend:latest",
       "essential": true,
       "portMappings": [
         {

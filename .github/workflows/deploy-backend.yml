@@ -1,26 +1,25 @@
-name: Deploy Backend to ECS (PROD)
+name: Deploy Backend to ECS
 
 on:
-  # Disable automatic deployment to PROD
-  # push:
-  #   branches:
-  #     - main
-  #   paths:
-  #     - 'backend/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type "CONFIRM" to deploy to PROD'
-        required: true
-        default: 'CANCEL'
+        description: 'Type "CONFIRM" to deploy manually'
+        required: false
+        default: 'CONFIRM'
 
 concurrency:
   group: deploy-backend-prod-${{ github.ref }}
-  cancel-in-progress: false # Better for prod to wait or fail than cancel midway
+  cancel-in-progress: false
 
 env:
   AWS_REGION:       ap-south-1
-  ECR_REGISTRY:     217757579310.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REGISTRY:     847013096108.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY:   axiora/pulse-fastapi
   ECS_CLUSTER:      axiora-pulse-cluster
   ECS_SERVICE:      pulse-backend-service
@@ -28,9 +27,7 @@ env:
 
 jobs:
   build-and-deploy:
-    if: github.event.inputs.confirm == 'CONFIRM'
     runs-on: ubuntu-latest
-    environment: production # Use GitHub Environments for protection
     permissions:
       contents: read
       id-token: write
@@ -42,7 +39,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume:        ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
