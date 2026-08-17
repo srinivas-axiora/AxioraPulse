@@ -61,11 +61,11 @@
         },
         {
           "name": "COGNITO_APP_CLIENT_ID",
-          "valueFrom": "arn:aws:ssm:ap-south-1:217757579310:parameter/axiorapulse/COGNITO_APP_CLIENT_ID"
+          "valueFrom": "arn:aws:ssm:ap-south-1:847013096108:parameter/axiorapulse/COGNITO_APP_CLIENT_ID"
         },
         {
           "name": "MIGRATION_LAMBDA_SECRET",
-          "valueFrom": "arn:aws:ssm:ap-south-1:217757579310:parameter/axiorapulse/MIGRATION_LAMBDA_SECRET"
+          "valueFrom": "arn:aws:ssm:ap-south-1:847013096108:parameter/axiorapulse/MIGRATION_LAMBDA_SECRET"
         }
       ],
       "logConfiguration": {
