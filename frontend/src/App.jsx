@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
+// Target AWS Deployment Account: 847013096108
 import PageLoader from "./pages/PageLoader";
 
 // ── Loading context ───────────────────────────────────────────────

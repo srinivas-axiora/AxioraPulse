@@ -1,7 +1,7 @@
 # AWS ECS Deployment Setup — AxioraPulse
 
 Complete one-time AWS setup for deploying frontend and backend to ECS Fargate behind CloudFront.  
-**Region:** `ap-south-1` (Mumbai) | **Account:** `217757579310` | **Domain:** `axiorapulse.com`
+**Region:** `ap-south-1` (Mumbai) | **Account:** `847013096108` | **Domain:** `axiorapulse.com`
 
 ---
 
@@ -119,8 +119,8 @@ The backend repo already exists. Create the frontend one.
 6. **Create repository**
 
 Your two repos are now:
-- `217757579310.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-fastapi` ✅
-- `217757579310.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-frontend` ✅
+- `847013096108.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-fastapi` ✅
+- `847013096108.dkr.ecr.ap-south-1.amazonaws.com/axiora/pulse-frontend` ✅
 
 ---
 
